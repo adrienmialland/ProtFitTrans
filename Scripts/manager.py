@@ -1,23 +1,51 @@
 
 import os
+import sys
 import esm
 import torch
 import shutil
 import itertools
 import numpy as np
 from pathlib import Path
-import scipy.stats as stats
 from datetime import datetime
 from sklearn.preprocessing import StandardScaler
 from esm import FastaBatchedDataset, pretrained, MSATransformer
 
 class EmbeddingsProcessorConfig():
-    def __init__(self, embs_model:str='esm1v_t33_650M_UR90S_1', log_transform:bool=False, extract:bool=True, max_num_embs_per_file:int=10000,
+    def __init__(self, embs_model:str='esm2_t33_650M_UR50D', extract:bool=True, log_transform:bool=False, max_num_embs_per_file:int=8000,
                  toks_per_batch:int=4066, truncation_seq_length:int=1022, nogpu:bool=False, warm_start:bool=True) -> None:
+        """
+        Configuration of the embeddings extraction, that uses fair-esm extractor (https://github.com/facebookresearch/esm)
+
+        Parameters
+        ----------
+        embs_model: str.
+            name of the ESM model used to extract the embeddings. It is automatically downloaded.
+            All models name are availble at https://github.com/facebookresearch/esm
+        extract: bool.
+            to easily activate or deactivate extraction.
+        log_transform: bool.
+            Whether or not to log transform the fitness values.
+        max_num_embs_per_file: int.
+            Maximum sizes of the final files containing the embeddings. The embeddings are first 
+            extracted in small batches and then gathered in bigger files.
+        toks_per_batch: int.
+            number of token used per batch, and therefore the number of sequence. the latter depends
+            on the number of token (i.e amino acids) contained per sequence.
+        truncation_seq_length: int.
+            limit the lenght of the input sequences. the ESM models maximum capacity being 1022.
+        nogpu: bool.
+            Allows to use the GPU is CUDA is available. 'True' ignores the GPU.
+        warm_start: bool.
+            whether or not to start the extraction where it has stopped. 
+            It is usefull in case the processing crashes for any reasons, 
+            to avoid having to processing again what have already been processing. 
+            However, configuration parameters should NOT be changed in between.
+        """        
         self.embs_model = embs_model
-        self.log_transform = log_transform
-        
         self.extract = extract
+        self.log_transform = log_transform
+
         self.max_num_embs_per_file = max_num_embs_per_file
         self.toks_per_batch = toks_per_batch
         self.truncation_seq_length = truncation_seq_length
@@ -90,13 +118,13 @@ class EmbeddingsProcessor(EmbeddingsProcessorConfig):
 
                 if torch.cuda.is_available() and not self.nogpu:
                     toks = toks.to(device="cuda", non_blocking=True)
-                out = model(toks, repr_layers=model.num_layers, return_contacts=False)
+                out = model(toks, repr_layers=[model.num_layers], return_contacts=False)
                 reprs = {layer: t.to(device="cpu") for layer, t in out["representations"].items()}
 
                 result = {}
                 for i, label in enumerate(labels):
                     truncate_len = min(self.truncation_seq_length, len(strs[i]))
-                    result[label] = {layer: t[i,1:truncate_len+1].mean(0).clone() for layer, t in reprs.items()}          
+                    result[label] = {layer: t[i,1:truncate_len+1].mean(0).clone() for layer, t in reprs.items()}
 
                 all_batch_file.append(Path(tmp_batches_d).joinpath(batch_file))
                 torch.save(result, all_batch_file[-1])
@@ -117,20 +145,21 @@ class EmbeddingsProcessor(EmbeddingsProcessorConfig):
                     torch.save(final_results, file_to_save)
                     file_count += 1
                     final_results = {}
-                    
+
                     save_msg = f'> {Path(file_to_save).name}'
                     if Path(file_to_save).is_file() == False:
                         save_msg += 'failed'
                         all_saved = False
                     else:
-                        save_msg += 'saved'
+                        save_msg += ' saved\n'
                     print(save_msg)
 
-                if all_saved:
-                    shutil.rmtree(tmp_batches_d)
-                else:
-                    print('embeddings gathering failed')
-                    print(f'individual embeddings available in:\n- {Path(tmp_batches_d)}\n')
+            if all_saved:
+                os.chmod(tmp_batches_d, 0o777)
+                shutil.rmtree(tmp_batches_d)
+            else:
+                print('embeddings gathering failed')
+                print(f'individual embeddings available in:\n- {Path(tmp_batches_d)}\n')
 
     def load(self):
         def get_info_from_header(header):
@@ -161,8 +190,9 @@ class EmbeddingsProcessor(EmbeddingsProcessorConfig):
             if organism not in embs:
                 embs[organism] = {'wt': None, 'variant': [], 'fitness': []}
 
-            repr = seq_repr[label]['mean_representations']
-            repr = list(repr.values())[0].tolist()
+            nums = seq_repr[label].keys()
+            repr = seq_repr[label][list(nums)[0]]
+            repr = [float(r) for r in repr]
 
             if mutation.lower() == 'wt':
                 if embs[organism]['wt'] is not None:
@@ -191,6 +221,22 @@ class EmbeddingsProcessor(EmbeddingsProcessorConfig):
         return embs
 
 class DatasetBuilderConfig():
+    """
+    Configuration of the dataset builder
+
+    Parameters
+    ----------
+    train_size: float.
+        size of the target data used for training
+    data_max_len: int.
+        number of instances of the addtional data to use. It is usefull if
+        the additional data, to be translocated, are big. It allows to repeatable
+        and randomly sample 'data_max_len' number of instances at each outer loop
+        of the nested cross-validation. 'None' means all additional data are used.
+    random_seed: int.
+        allows to seed the random states, to get repeatable results.
+
+    """    
     def __init__(self, train_size:float=0.8, data_max_len:int=None, random_seed:int=None) -> None:
         self.train_size = train_size
         if data_max_len is None:
@@ -305,6 +351,34 @@ from scipy.stats import spearmanr
 
 class RegressionModelConfig():
     def __init__(self, model_type:str='svr', n_splits:int=5, n_repeats:int=1, parameter_grid:dict|list=None, optimize_once:bool=False, random_seed:int=None) -> None:
+        """
+        Configuration of the regression model used for fitness prediction.
+
+        Parameters
+        ----------
+        model_type: str.
+            regression model used for fitness prediction. 'svr' or 'lasso' are available
+        n_splits: int.
+            number of fold used in the inner cross-validation for hyperparameters optimizations.
+            Unless 'optimize_once' is set to 'True', it is performed for each outer loop of the 
+            nested cross-validation. A higher number can significantly increase the processing time.
+        n_repeats: int.
+            number of time to repeat the inner cross-validation for hyperparameters optimizations.
+            the final number of inner loop is therefore 'n_splits'*'n_repeats'. Unless 'optimize_once'
+            is set to 'True', it is performed for each outer loop of the nested cross-validation. 
+            A higher number can significantly increase the processing time.
+        parameter_grid: dict|list.
+            parameter grid to be used in hyperparameters optimization in the inner loop.
+            If 'None, the default grid is used.
+        optimize_once: bool.
+            When 'True', the hyperparameters are only optimized in the first outer loop of the
+            nested cross-validation, for each combinations. The resulting hyperparameters are 
+            then used for subsequent loops with the corresponding combinations. This is usefull
+            to save time an try configurations. However, while this should provide valid results,
+            the final processing should be done with 'optimize_once' to False, to better fit the data.
+        rand_seed: int.
+            allows to seed the random states, to get repeatable results.
+        """
         self.model_type = model_type.lower()
         self.n_splits = n_splits
         self.n_repeats = n_repeats
@@ -324,32 +398,25 @@ class RegressionModel(RegressionModelConfig):
     def get_default_grid(self):
         if self.model_type == 'lasso':
             return {
-                "alpha": [float(f"1e{n}") for n in range(-3, -1)]
-            }
-        elif self.model_type == 'rf':
-            return {
-                'n_estimators': [300, 500, 700, 1000, 1200, 1400, 1600],
-                'max_depth'   : [3, 5, 10, 15, 20, 25, 30, 40, 50, 60],
-                'max_features': ['sqrt', 'log2'],
+                "alpha": [0.001, 0.005, 0.01]
             }
         elif self.model_type == 'svr':
             return [
-                {'kernel': ['rbf'], 'gamma': ['scale', 'auto'], 'C': [0.5, 1, 5, 10, 20, 40, 50]},
-                {'kernel': ['poly'], 'degree': [2, 3, 4], 'gamma': ['scale', 'auto'], 'C': [0.5, 1, 5, 10, 20, 40, 50]}
+                {'kernel': ['rbf'], 'gamma': ['scale', 'auto'], 'C': [0.5, 1, 5, 10, 20, 40, 50, 75]},
+                {'kernel': ['poly'], 'degree': [2, 3, 4], 'gamma': ['scale', 'auto'], 'C': [0.5, 1, 5, 10, 20, 40, 50, 75]}
             ]
 
     def get_regressor(self):
         if self.model_type == 'lasso':
             return Lasso(**self.regressor_params, max_iter=self.lasso_max_iter)
-        elif self.model_type == 'rf':
-            return RandomForestRegressor(**self.regressor_params, random_state=42)
         elif self.model_type == 'svr':
             return SVR(**self.regressor_params)
-    
+
     def grid_search_cross_validation(self, X, y, n_jobs):
         if self.optimized == True:
-            print(f"- gris search cv skipped (optimize_one={self.optimize_once})")
-        print(f"- grid search cv (regressor={self.model_type}, n_splits={self.n_splits}, n_repeats={self.n_repeats})")
+            print(f"- gris search inner cv skipped (optimize_one={self.optimize_once})")
+            return
+        print(f"- grid search inner cv (regressor={self.model_type}, n_splits={self.n_splits}, n_repeats={self.n_repeats})")
 
         if self.parameter_grid is None:
             self.parameter_grid = self.get_default_grid()
@@ -359,11 +426,11 @@ class RegressionModel(RegressionModelConfig):
         lasso_grid = GridSearchCV(estimator=regressor, param_grid=self.parameter_grid, cv=RepeaKFold, n_jobs=n_jobs)
 
         self.regressor_params = lasso_grid.fit(X, y).best_params_
-        print(f"best params:" + ", ".join([f"{p}: {v}" for p, v in self.regressor_params.items()]))
+        print(f"- best params:" + ", ".join([f"{p}: {v}" for p, v in self.regressor_params.items()]))
 
         if self.optimize_once:
             self.optimized = True
-        
+
     def fit_pred(self, X_train, y_train, X_test):
         print(f'- evaluating with best model')
         regressor = self.get_regressor()
@@ -374,6 +441,19 @@ class RegressionModel(RegressionModelConfig):
         mse  = mean_squared_error(y_true, y_pred)
         r, _ = spearmanr(y_true, y_pred)
         return mse, r
+    
+class TeeOutput:
+    def __init__(self, file):
+        self.terminal = sys.stdout
+        self.logfile = open(file, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.logfile.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.logfile.flush()
 
 class Utils():
     def __init__(self, save_data:bool=True) -> None:

@@ -3,7 +3,9 @@
 # patch_sklearn()
 
 import os
+import sys
 import click
+import traceback
 import numpy as np
 
 from pathlib import Path
@@ -12,29 +14,73 @@ import scipy.stats as stats
 from datetime import datetime
 from joblib import delayed, Parallel
 
-from manager import EmbeddingsProcessor, EmbeddingsProcessorConfig
-from manager import DatasetBuilder, DatasetBuilderConfig
-from manager import RegressionModel, RegressionModelConfig
-from manager import Utils
+from scripts.manager import EmbeddingsProcessor, EmbeddingsProcessorConfig
+from scripts.manager import DatasetBuilder, DatasetBuilderConfig
+from scripts.manager import RegressionModel, RegressionModelConfig
+from scripts.manager import TeeOutput, Utils
 
-ROOT_DIR = Path(__file__).parent.absolute()
+ROOT_DIR = Path(__file__).parents[1].absolute()
 DATA_DIR = ROOT_DIR.joinpath('data')
-MODL_DIR = ROOT_DIR.joinpath('models')
 
 class ProtFitTransConfig():
-    def __init__(self, fasta_file:str, target:str, min_imp:float=0.1, alpha:float=0.05, homologs:list=[], n_min:int=10, n_max:int=100, forced_N:int=None) -> None:
+    def __init__(self, fasta_file:str, target:str, min_imp:float=0.1, alpha:float=0.05, homologs:list=[], N_loop:int=50, n_min:int=10, n_max:int=100) -> None:
+        """
+        configuration of the Fitness Translocation method
+
+        Parameters
+        ----------
+        fasta_file: str.
+            fasta file to process. It can ether be a path or a name. If it is a name, 
+            the file should first be placed in the 'data' folder. the header of each sequence
+            contained in the fasta file should be of one the following format:
+            - species-optional_info|mutation|fitness
+                example: SsIGPS-27-248|I160F|-1.021817327
+            - species|mutation|fitness
+                example: SsIGPS|I160F|-1.021817327
+            in either of these format, the extracted data are: SsIGPS, I160F, -1.021817327
+        target: str.
+            protein name to be used as the target. the name should be the same as
+            the name specified in the fasta file.
+        min_imp: float.
+            The minimal improvement that an translocated dataset may provide and that will
+            be considered significant by the statistical paired t-test. Smaller 'min_imp' 
+            requires higher N, with 'min_imp' being proportional to 1/sqrt(N).
+        alpha: float.
+            Significance threshold used by the statistical paired t-test.
+        homologs: list.
+            Protein species considered for translocation, based on all specicies specified 
+            in the fasta file. If en empty list is provided, all species are used.
+        N_loop: int.
+            Number of outer loop of the Nested cross-validation, before conducted a paired t-test.
+            If it is set to None, 'n_min' and 'n_max' are used instead, and the outer loops will stop 
+            either when 'min_imp' is considered detectable, or when 'n_max' is reached: For each loop,
+            the variance of the data is estimated, and 'min_imp' is checked for significance. 
+            This allows to avoid repeadly looking at the average of the data, which would artificially 
+            inflate 'alpha'. So, only 'min_imp' is compared to the current t-test treshold. It can be usefull 
+            to get a rough estime of the 'N_loop' required for a given configuration. 'n_min' should not be
+            set too small to get a stable estimation of the variance of the data. However, this should
+            only be used for rough estimate, and the use of 'N_loop' should be prefered to avoid fluctuations.
+        n_min: int.
+            minimal number of outer loop of the Nested cross-validation. 
+            It is ignored if 'N_loop' is not None.
+        n_max: int.
+            maximal number of outer loop of the Nested cross-validation.
+            It is ignored if 'N_loop' is not None.
+        """
         assert target not in homologs, 'the list of homologs cannot contain the target protein'
-        assert n_max >= n_min, 'n_max should be superior to n_min'
+        assert n_max >= n_min, 'n_max should be superior to n_min'        
         self.fasta_file = fasta_file
         self.target = target
         self.min_imp = min_imp
         self.alpha = alpha
-        self.homologs = homologs        
+        self.homologs = homologs
+        self.N_loop = N_loop
+
         self.n_min = max(2, n_min)
         self.n_max = n_max
-        if forced_N is not None:
-            forced_N = max(2, forced_N)
-        self.forced_N = forced_N
+        if N_loop is not None:
+            N_loop = max(2, N_loop)
+        self.N_loop = N_loop
 
 class Runner(ProtFitTransConfig):
     def __init__(
@@ -52,22 +98,18 @@ class Runner(ProtFitTransConfig):
 
         Parameters
         ----------
-        sub_comb_idx: list:
-            ...
-        random_seeds: int
-            used as an offset to the actually random_seed applied during computation. 
-            the seeds allow the get repeatable results, and adding an offset gives a 
-            new set of repeatable results. So, it allows to change what instances are 
-            sampled when the dataset is very sensitive to subsampling for instance.            
+        config_*: classes.
+            configuration classes, see related definitions.
         warm_start: bool
-            whether or not to use already processed data. It is usefull in case the
-            processing crashes for any reasons, to avoid having to processing again
-            what have already been processing. However, configuration parameters 
-            should NOT be changed in between.
-        parallelizing: bool
-            whether or not to parallelize the computation. In most cases it will 
-            speed up processing. However, when dataset is small it may not, because 
-            of the overhead required to setup the parrallelization. Also, parallelizing
+            whether or not to use already processed data saved during processing. So
+            'save_data' should also be set to True, otherwise no data are available for
+            'warm_start'. It is usefull in case the processing crashes for any reasons, 
+            to avoid having to processing again what have already been processing. 
+            However, configuration parameters should NOT be changed in between.
+        n_jobs: int
+            Number of jobs to run in parallel. -1 means all jobs. None means no parrallelism
+            In most cases it will speed up processing. When dataset is small it may not, 
+            because of the overhead required to setup the parrallelization. Also, parallelizing
             with too little memory may crash.
         save_data: bool
             allows to easily activate or deactivate data saving. When set to False,
@@ -89,9 +131,12 @@ class Runner(ProtFitTransConfig):
         self.warm_start = warm_start
         self.n_jobs = self.utils.get_num_jobs(n_jobs)
 
-        rslt_name = Path(config_ProtFitTrans.fasta_file).stem + f"__{Path(config_embs.embs_model).stem}"
-        rslt_name = rslt_name + f"__{config_regressor.model_type}" + f"_results.npy"
+        base_name = Path(config_ProtFitTrans.fasta_file).stem + f"__{Path(config_embs.embs_model).stem}"
+        rslt_name = base_name + f"__{config_regressor.model_type}" + f"_results.npy"
+        logf_name = base_name + f"__{config_regressor.model_type}" + f"_log.txt"
         self.results_file = result_dir.joinpath(rslt_name)
+        self.logf_name = result_dir.joinpath(logf_name)
+        sys.stdout = TeeOutput(self.logf_name)
 
         self.check_embs_exist = True
         self.combine_symb = '_'
@@ -102,8 +147,21 @@ class Runner(ProtFitTransConfig):
         print(f'\nfasta file : {Path(self.fasta_file).name}')
         print(f'embed file : {Path(self.embeddings.output_file).name}')
         print(f'result file: {Path(self.results_file).name}')
+        print(f'log file   : {Path(self.logf_name).name}')
         print(f'model name : {self.embeddings.embs_model}\n')
 
+    def launch(self):
+        try:
+            if self.embeddings.extract:
+                self.extract_embs()
+
+            self.load_and_translocate_embs()
+            self.evaluate_translocations()
+
+            self.finalize_and_print_results()
+        except Exception as e:
+            print(f"Error occurred: {e}")
+            traceback.print_exc()
 
     def extract_embs(self):
         if self.check_embs_exist and Path(self.embeddings.output_file).is_file():
@@ -151,8 +209,9 @@ class Runner(ProtFitTransConfig):
             'min imp': self.min_imp,
             'alpha': self.alpha,
             'homologs': self.homologs,
-            'n min': self.n_min,
-            'n max': self.n_max
+            'N loop': self.N_loop,
+            'n min': self.n_min if self.N_loop is None else 'ignored',
+            'n max': self.n_max if self.N_loop is None else 'ignored'
         }
         self.running_data['info']['embeddings'] = {
             'embs model': self.embeddings.embs_model,
@@ -179,11 +238,9 @@ class Runner(ProtFitTransConfig):
             for info in self.running_data['info'][type_info]:
                 print('-', str(info).ljust(14), ':', self.running_data['info'][type_info][info])
 
-        if self.forced_N is not None:
-            self.n_min = self.forced_N
-            self.n_max = self.forced_N
-            print(f'forcing number of loop N={self.forced_N}')
-            print(f'ignoring n_min and n_max')
+        if self.N_loop is not None:
+            self.n_min = self.N_loop
+            self.n_max = self.N_loop
 
         self.start_evaluate_trans = lambda: print('\n## starting translocation evaluation')
         self.single_hom_selection = lambda: print('\n# single homolog translocation evaluation loop')
@@ -198,9 +255,6 @@ class Runner(ProtFitTransConfig):
             print(f'\nLoading warm results from:\n> {Path(self.results_file).name}')
             assert self.warm_results is None, 'warm results already loaded'
             self.running_data = np.load(self.results_file, allow_pickle=True).item()
-
-            # if 'SsIGPS' in self.running_data:
-            #     self.running_data.pop('SsIGPS')
 
             self.warm_results = {}
             print('\navailable warm results:')
@@ -261,16 +315,6 @@ class Runner(ProtFitTransConfig):
     def fit_predict_evaluate(self, n: int, target: str, homologs:list=[]):
         if self.is_warm_results([target] + homologs) == True:
             return
-
-        if homologs == []: loc = 0.4
-        if homologs == ['TmIGPS']: loc = 0.6
-        if homologs == ['TtIGPS']: loc = 0.9
-        if homologs == ['TmIGPS', 'TtIGPS']: loc = 0.45
-        if homologs == ['TtIGPS', 'TmIGPS']: loc = 0.45
-        np.random.seed(None)
-        results = [np.random.normal(loc=loc, scale=0.15), np.random.normal(loc=loc, scale=0.15)]
-        self.add_and_save_results(*results, [target]+homologs)
-        return
 
         train_test_data = self.dataset.get_nth_dataset(n, self.embs, target, homologs)
         self.regressor.grid_search_cross_validation(*train_test_data[:2], self.n_jobs)
@@ -337,10 +381,10 @@ class Runner(ProtFitTransConfig):
                 self.running_data[name]['diff_p_value'] = p_value
 
             if n + 1 >= self.n_max:
-                if self.forced_N is None:
+                if self.N_loop is None:
                     print(f"\nn_max={self.n_max} number of loop reached")
                 else:
-                    print(f"\nforce_N={self.forced_N} number of loop reached")
+                    print(f"\nN_loop={self.N_loop} number of loop reached")
             else:
                 print(f'\nmin improvements significance reached in n={n+1} loops')
             return True
@@ -410,6 +454,11 @@ class Runner(ProtFitTransConfig):
                 self.protein_to_keep.append(homolog)
 
     def finalize_and_print_results(self):
+        if Path(self.results_file).is_file():
+            results = np.load(self.results_file, allow_pickle=True).item()
+        else:
+            assert len(self.running_data) != 0
+            results = self.running_data
 
         results = np.load(self.results_file, allow_pickle=True).item()
         results = self.running_data
@@ -460,8 +509,12 @@ class Runner(ProtFitTransConfig):
         print('\nresults: mean (std) type pvalue [proteins]')
         for msg in messages:
             print(msg)
-        print('\n>> best result (significant={}): {}'.format(*best_result))
+        print('\n>> best result (is_significant={}): {}'.format(*best_result))
         print('>> obtained with: N={}, alpha={}, min_imp={}\n'.format(self.N, self.alpha, self.min_imp))
+
+        print('results files:')
+        print(self.results_file)
+        print(self.logf_name)
 
         self.utils.save_to_file(self.results_file, results)
         self.utils.print_ellapsed_time(self.tstart)
