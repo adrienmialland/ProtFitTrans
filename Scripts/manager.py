@@ -391,9 +391,8 @@ class RegressionModel(RegressionModelConfig):
         self.__dict__.update(config.__dict__)
 
         self.lasso_max_iter = 200000
-
-        self.optimized = False
         self.regressor_params = {}
+        self.current_params = {}
     
     def get_default_grid(self):
         if self.model_type == 'lasso':
@@ -402,39 +401,38 @@ class RegressionModel(RegressionModelConfig):
             }
         elif self.model_type == 'svr':
             return [
-                {'kernel': ['rbf'], 'gamma': ['scale', 'auto'], 'C': [0.5, 1, 5, 10, 20, 40, 50, 75]},
-                {'kernel': ['poly'], 'degree': [2, 3, 4], 'gamma': ['scale', 'auto'], 'C': [0.5, 1, 5, 10, 20, 40, 50, 75]}
+                {'kernel': ['rbf'], 'gamma': ['scale', 'auto'], 'C': [0.1, 0.5, 1, 5, 10, 20, 40]},
             ]
 
     def get_regressor(self):
         if self.model_type == 'lasso':
-            return Lasso(**self.regressor_params, max_iter=self.lasso_max_iter)
+            return Lasso(**self.current_params, max_iter=self.lasso_max_iter)
         elif self.model_type == 'svr':
-            return SVR(**self.regressor_params)
+            return SVR(**self.current_params)
 
-    def grid_search_cross_validation(self, X, y, n_jobs):
-        if self.optimized == True:
-            print(f"- gris search inner cv skipped (optimize_one={self.optimize_once})")
-            return
-        print(f"- grid search inner cv (regressor={self.model_type}, n_splits={self.n_splits}, n_repeats={self.n_repeats})")
+    def grid_search_cross_validation(self, X, y, n_jobs, config_name):
+        if self.optimize_once and config_name in self.regressor_params:
+            print(f"- gris search inner cv skipped (optimize_once={self.optimize_once})")
+            self.current_params = self.regressor_params[config_name]
+        else:
+            print(f"- grid search inner cv (regressor={self.model_type}, n_splits={self.n_splits}, n_repeats={self.n_repeats}, n_jobs={n_jobs})")
 
-        if self.parameter_grid is None:
-            self.parameter_grid = self.get_default_grid()
+            if self.parameter_grid is None:
+                self.parameter_grid = self.get_default_grid()
 
-        regressor  = self.get_regressor()
-        RepeaKFold = RepeatedKFold(n_splits=self.n_splits, n_repeats=self.n_repeats, random_state=self.random_seeds)
-        lasso_grid = GridSearchCV(estimator=regressor, param_grid=self.parameter_grid, cv=RepeaKFold, n_jobs=n_jobs)
+            regressor  = self.get_regressor()
+            RepeaKFold = RepeatedKFold(n_splits=self.n_splits, n_repeats=self.n_repeats, random_state=self.random_seeds)
+            lasso_grid = GridSearchCV(estimator=regressor, param_grid=self.parameter_grid, cv=RepeaKFold, n_jobs=n_jobs)
 
-        self.regressor_params = lasso_grid.fit(X, y).best_params_
-        print(f"- best params:" + ", ".join([f"{p}: {v}" for p, v in self.regressor_params.items()]))
+            self.current_params = lasso_grid.fit(X, y).best_params_
+            self.regressor_params[config_name] = self.current_params
 
-        if self.optimize_once:
-            self.optimized = True
+        print(f"- best params:" + ", ".join([f"{p}: {v}" for p, v in self.current_params.items()]))
 
     def fit_pred(self, X_train, y_train, X_test):
         print(f'- evaluating with best model')
         regressor = self.get_regressor()
-        regressor.fit(X_train, y_train)  
+        regressor.fit(X_train, y_train)
         return regressor.predict(X_test)
     
     def evaluate(self, y_true, y_pred):
@@ -450,6 +448,7 @@ class TeeOutput:
     def write(self, message):
         self.terminal.write(message)
         self.logfile.write(message)
+        self.logfile.flush()
 
     def flush(self):
         self.terminal.flush()
@@ -470,7 +469,7 @@ class Utils():
     def print_ellapsed_time(self, start):
         now = datetime.now()
         ell = now - start
-        print(ell, f'({now.hour}h{now.minute})')
+        print('time ellapsed -', ell, f'({now.hour}h{now.minute})')
 
     def save_to_file(self, file_path, data):
         if self.save_data:

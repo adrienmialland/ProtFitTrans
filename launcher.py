@@ -24,8 +24,9 @@ if __name__ == '__main__':
         random_seed = None
     )
     config_regressor = RegressionModelConfig(
-        model_type  = 'svr',
-        random_seed = None
+        model_type    = 'svr',
+        optimize_once = True,
+        random_seed   = None
     )
 
     runner = Runner(

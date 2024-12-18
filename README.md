@@ -1,2 +1,2 @@
 # ProtFitTrans
-Implementation of a new, biologically-grounded, data augmentation method for protein variant effect prediction.
+Fitness translocation: improving variant effect prediction with biologically-grounded data augmentation

@@ -107,10 +107,8 @@ class Runner(ProtFitTransConfig):
             to avoid having to processing again what have already been processing. 
             However, configuration parameters should NOT be changed in between.
         n_jobs: int
-            Number of jobs to run in parallel. -1 means all jobs. None means no parrallelism
-            In most cases it will speed up processing. When dataset is small it may not, 
-            because of the overhead required to setup the parrallelization. Also, parallelizing
-            with too little memory may crash.
+            Number of jobs to run the GridSearch in parallel. -1 means all jobs, 'None' means no parrallelism.
+            Future version should allow to parralelize the Fitness translocations as well.
         save_data: bool
             allows to easily activate or deactivate data saving. When set to False,
             no results are saved in the output file.
@@ -156,7 +154,7 @@ class Runner(ProtFitTransConfig):
                 self.extract_embs()
 
             self.load_and_translocate_embs()
-            self.evaluate_translocations()
+            self.evaluate_translocations()             
 
             self.finalize_and_print_results()
         except Exception as e:
@@ -194,7 +192,7 @@ class Runner(ProtFitTransConfig):
     def setup_evaluation(self):
         self.homolog_are_sig = []
         self.protein_to_keep = []
-        self.warm_results = None
+        self.warm_results_count = None
         self.current_warm = []
 
         self.empty_data = {'mse': [], 'pearson_r': [], 'best_params': [], 'diff_p_value': None}
@@ -232,12 +230,14 @@ class Runner(ProtFitTransConfig):
             'optimize once': self.regressor.optimize_once,
             'random seed': self.regressor.random_seeds,
         }
-        print('\nalgorithm parameters summary :')
-        for type_info in self.running_data['info']:
-            print('\n>', type_info, ':')
-            for info in self.running_data['info'][type_info]:
-                print('-', str(info).ljust(14), ':', self.running_data['info'][type_info][info])
 
+        def show_parameters(params_info, msg):
+            print(msg)
+            for type_info in params_info:
+                print('\n>', type_info, ':')
+                for info in params_info[type_info]:
+                    print('-', str(info).ljust(14), ':', params_info[type_info][info])
+        
         if self.N_loop is not None:
             self.n_min = self.N_loop
             self.n_max = self.N_loop
@@ -245,42 +245,46 @@ class Runner(ProtFitTransConfig):
         self.start_evaluate_trans = lambda: print('\n## starting translocation evaluation')
         self.single_hom_selection = lambda: print('\n# single homolog translocation evaluation loop')
         self.sorting_selected_hom = lambda: print('\n# sorting selected single homologs')
-        self.best_trans_selection = lambda: print('\n# multiple homolog translocation evaluation loop')
+        self.best_trans_selection = lambda no: print('\n# multiple homolog translocation evaluation loop' + '\n> skipping - no successful candidates' if no else '')
 
-        if self.warm_start == False:
-            pass
-        elif Path(self.results_file).is_file() == False:
-            pass
+        if self.warm_start == False or Path(self.results_file).is_file() == False:
+            show_parameters(self.running_data['info'], '\nalgorithm parameters summary :')
         else:
             print(f'\nLoading warm results from:\n> {Path(self.results_file).name}')
-            assert self.warm_results is None, 'warm results already loaded'
-            self.running_data = np.load(self.results_file, allow_pickle=True).item()
-
-            self.warm_results = {}
+            assert self.warm_results_count is None, 'warm results already loaded'
+            
+            warm_results = np.load(self.results_file, allow_pickle=True).item()
+            show_parameters(warm_results['info'], '\nwarm results parameters summary :')
+            assert warm_results['info'] == self.running_data['info'], 'current parameters and parameters used to obtain warm results should be similar'
+            
+            self.regressor.regressor_params = deepcopy(warm_results['regressor_params'])
+            self.running_data = deepcopy(warm_results)
+            self.warm_results_count = {}
             print('\navailable warm results:')
             for res_name in self.running_data:
+                if res_name in ['info', 'regressor_params']:
+                    continue
                 print(f'> {res_name.split(self.combine_symb)}:')
                 len_res = len(self.running_data[res_name]['pearson_r'])
                 if len_res > 0:
-                    self.warm_results[res_name] = len_res
-                    print(f'- n={self.warm_results[res_name]} loops to load')
+                    self.warm_results_count[res_name] = len_res
+                    print(f'- n={self.warm_results_count[res_name]} loops to load')
                 else:
                     print(f'- no warm results')
         
         self.start_evaluate_trans()
 
-
     def is_warm_results(self, proteins):
         res_name = self.combine_symb.join(proteins)
 
-        if self.warm_results is None:
+        if self.warm_results_count is None:
             is_warm = False
-        elif res_name in self.warm_results:
-            if self.warm_results[res_name] == 0:
-                self.warm_results.pop(res_name)
+        elif res_name in self.warm_results_count:
+            if self.warm_results_count[res_name] == 0:
+                self.warm_results_count.pop(res_name)
                 is_warm = False
             else:
-                self.warm_results[res_name] -= 1
+                self.warm_results_count[res_name] -= 1
                 is_warm = True
         else:
             is_warm = False
@@ -292,11 +296,6 @@ class Runner(ProtFitTransConfig):
         return is_warm
     
     def get_num_parallele_task(self, n):
-        if self.N is None:
-            num_proteins = len(self.homologs) + 1
-            if n + 1 == self.n_max:
-                return num_proteins * int(np.ceil(len(self.parallele_task)/num_proteins))
-            return num_proteins * round(self.n_jobs / num_proteins)
         if n + 1 == self.N:
             return len(self.parallele_task)
         return self.n_jobs
@@ -310,6 +309,8 @@ class Runner(ProtFitTransConfig):
         self.running_data[result_name]['pearson_r'].append(pear_r)
         self.running_data[result_name]['best_params'].append(self.regressor.regressor_params)
 
+        self.running_data['regressor_params'] = self.regressor.regressor_params
+
         self.utils.save_to_file(self.results_file, self.running_data)
 
     def fit_predict_evaluate(self, n: int, target: str, homologs:list=[]):
@@ -317,12 +318,14 @@ class Runner(ProtFitTransConfig):
             return
 
         train_test_data = self.dataset.get_nth_dataset(n, self.embs, target, homologs)
-        self.regressor.grid_search_cross_validation(*train_test_data[:2], self.n_jobs)
+        self.regressor.grid_search_cross_validation(*train_test_data[:2], self.n_jobs, '_'.join([target] + homologs))
 
-        if self.n_jobs is None:
+        # To be corrected. Parallele processing fails.
+        # if self.n_jobs is None:
+        if True:
             y_pred = self.regressor.fit_pred(*train_test_data[:3])
             result = self.regressor.evaluate(train_test_data[3], y_pred)
-            self.add_and_save_results(*result, [target]+homologs) 
+            self.add_and_save_results(*result, [target]+homologs)
         else:
             self.parallele_task.append(delayed(self.regressor.fit_pred)(*train_test_data[:3]))
             self.parallele_info.append([target]+homologs)
@@ -403,13 +406,13 @@ class Runner(ProtFitTransConfig):
                 transl_resu = self.running_data[name]['pearson_r']
                 significant_homologs.append(homolog)
                 sig_homologs_results.append(np.mean(transl_resu))
-        
+                
         argsort = np.argsort(sig_homologs_results)[::-1]
         sort_homologs = [significant_homologs[i] for i in argsort]
         best_homologs = sort_homologs.pop(0)
 
         print(f'> best single homolog translocation : {best_homologs}')
-        print(f'> multiple translocation candidates : {sort_homologs}')
+        print(f'> multiple translocation candidates : {sort_homologs}') 
         return best_homologs, sort_homologs
 
     def check_for_improvement(self, homolog) -> bool:
@@ -432,7 +435,7 @@ class Runner(ProtFitTransConfig):
 
     def evaluate_translocations(self):
         self.setup_evaluation()
-
+        
         self.single_hom_selection()
         for n in self.utils.count_loop(None):
             self.fit_predict_evaluate(n, self.target)
@@ -446,7 +449,7 @@ class Runner(ProtFitTransConfig):
         best_hom, candidate_homs = self.sort_significant_homologs()
         self.protein_to_keep.append(best_hom)
 
-        self.best_trans_selection()
+        self.best_trans_selection(len(candidate_homs) == 0)
         for homolog in candidate_homs:
             for n in self.utils.count_loop(self.N):
                 self.fit_predict_evaluate(n, self.target, self.protein_to_keep + [homolog])
@@ -454,40 +457,34 @@ class Runner(ProtFitTransConfig):
                 self.protein_to_keep.append(homolog)
 
     def finalize_and_print_results(self):
-        if Path(self.results_file).is_file():
-            results = np.load(self.results_file, allow_pickle=True).item()
-        else:
-            assert len(self.running_data) != 0
-            results = self.running_data
-
-        results = np.load(self.results_file, allow_pickle=True).item()
-        results = self.running_data
-        results_names = list(results.keys())
+        print(f'\n# finalize, print, save results')
+        results_names = list(self.running_data.keys())
         results_names.remove('info')
+        results_names.remove('regressor_params')
 
         all_mean = []
         for res_name in results_names:
-            corr = results[res_name]['pearson_r']
-            results[res_name]['mean_pearson_r'] = np.mean(corr)
-            results[res_name]['std_pearson_r'] = np.std(corr)
+            corr = self.running_data[res_name]['pearson_r']
+            self.running_data[res_name]['mean_pearson_r'] = np.mean(corr)
+            self.running_data[res_name]['std_pearson_r'] = np.std(corr)
 
-            mse = results[res_name]['mse']
-            results[res_name]['mean_mse'] = np.mean(mse)
-            results[res_name]['std_mse'] = np.std(mse)
+            mse = self.running_data[res_name]['mse']
+            self.running_data[res_name]['mean_mse'] = np.mean(mse)
+            self.running_data[res_name]['std_mse'] = np.std(mse)
 
-            all_mean.append(results[res_name]['mean_pearson_r'])
+            all_mean.append(self.running_data[res_name]['mean_pearson_r'])
 
         targ_mean = self.running_data[self.target]['mean_pearson_r']
-        best_result = None   
+        best_result = None
         messages = []
 
         for i in np.argsort(all_mean)[::-1]:
             res_name = results_names[i]
             proteins = res_name.split(self.combine_symb)
 
-            mean_pears = results[res_name]['mean_pearson_r']
-            std_pears  = results[res_name]['std_pearson_r']
-            p_value    = results[res_name]['diff_p_value']
+            mean_pears = self.running_data[res_name]['mean_pearson_r']
+            std_pears  = self.running_data[res_name]['std_pearson_r']
+            p_value    = self.running_data[res_name]['diff_p_value']
 
             if best_result is None:
                 best_result = [p_value < self.alpha, proteins]
@@ -514,9 +511,9 @@ class Runner(ProtFitTransConfig):
 
         print('results files:')
         print(self.results_file)
-        print(self.logf_name)
+        print(self.logf_name, '\n')
 
-        self.utils.save_to_file(self.results_file, results)
+        self.utils.save_to_file(self.results_file, self.running_data)
         self.utils.print_ellapsed_time(self.tstart)
 
 
